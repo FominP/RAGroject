@@ -1,0 +1,19 @@
+# Файлы с секретами
+.env
+
+# Файлы и папки вашей IDE
+.git/
+.vscode/
+.idea/
+*.code-workspace
+
+# Системные файлы, которые не нужны внутри контейнера
+__pycache__/
+*.pyc
+myenv/       # папка вашего виртуального окружения
+.gitignore
+.dockerignore
+
+test_embed.py
+test_api.ipynb
+readme.md
