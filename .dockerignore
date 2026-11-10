@@ -11,9 +11,12 @@
 __pycache__/
 *.pyc
 myenv/       # папка вашего виртуального окружения
+.venv/
+venv/
+.cache/
+fastembed_cache/
 .gitignore
 .dockerignore
-
-test_embed.py
-test_api.ipynb
-readme.md
+.pytest_cache/
+.ruff_cache/
+tests/

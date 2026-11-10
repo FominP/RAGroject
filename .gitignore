@@ -21,7 +21,6 @@ __pycache__/
 *.swo
 
 # Docker
-.dockerignore  # необязательно, но можно исключить сам файл
 *.log
 
 # Streamlit
@@ -35,6 +34,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Тестовые файлы (если есть)
-test_*.py
-test_*.ipynb
+# Local model cache
+.cache/
+fastembed_cache/

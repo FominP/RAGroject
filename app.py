@@ -1,150 +1,223 @@
-import streamlit as st
+from __future__ import annotations
+
+import hashlib
+import logging
 import os
-import requests
-from PyPDF2 import PdfReader
-from dotenv import load_dotenv
 
-# --- Загрузка переменных окружения ---
-def clean(var: str) -> str:
-    if not var:
-        return ""
-    var = var.strip()
-    if var.startswith('"') and var.endswith('"'):
-        var = var[1:-1]
-    if var.startswith("'") and var.endswith("'"):
-        var = var[1:-1]
-    return var.strip()
+import streamlit as st
 
-try:
-    API_KEY = clean(st.secrets["YANDEX_API_KEY"])
-    FOLDER_ID = clean(st.secrets["YANDEX_CATALOG_ID"])
-except Exception:
-    load_dotenv()
-    API_KEY = clean(os.getenv("YANDEX_API_KEY", ""))
-    FOLDER_ID = clean(os.getenv("YANDEX_CATALOG_ID", ""))
+from src.chunking import chunk_pages
+from src.embeddings import FastEmbedder
+from src.generation import GeminiClient, GenerationError, answer_question
+from src.pdf_parser import PDFError, parse_pdf
+from src.retrieval import VectorIndex
 
-if not API_KEY or not FOLDER_ID:
-    st.error("Не найдены YANDEX_API_KEY или YANDEX_CATALOG_ID")
-    st.stop()
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+MAX_QUESTIONS_PER_SESSION = 10
+logger = logging.getLogger(__name__)
 
-# --- Функция вызова YandexGPT (генерация) ---
-def call_yandex_gpt(prompt: str, max_tokens: int = 2000, temperature: float = 0.3, system_prompt: str = None) -> str:
-    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-    headers = {
-        "Authorization": f"Api-Key {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "text": system_prompt})
-    messages.append({"role": "user", "text": prompt})
-    data = {
-        "modelUri": f"gpt://{FOLDER_ID}/yandexgpt-lite/latest",
-        "completionOptions": {
-            "stream": False,
-            "temperature": temperature,
-            "maxTokens": max_tokens
-        },
-        "messages": messages
-    }
-    response = requests.post(url, headers=headers, json=data)
-    response.raise_for_status()
-    result = response.json()
-    return result['result']['alternatives'][0]['message']['text']
 
-# --- Анализ документа с синтезом итогового ответа ---
-def analyze_document(text: str, analysis_type: str, user_question: str = None) -> str:
-    max_chunk_size = 5000  # символов, безопасно для модели (~600-700 токенов)
-    chunks = [text[i:i+max_chunk_size] for i in range(0, len(text), max_chunk_size)]
-    
-    # Режим "Ответ на вопрос" – используем полный текст (ограниченный до 12k символов)
-    if analysis_type == "Ответ на вопрос":
-        if not user_question:
-            return "Не задан вопрос."
-        full_text = text[:12000]  # ограничение, чтобы не превысить контекст
-        prompt = f"""Ответь на вопрос, используя только содержимое документа. Если ответа нет в документе, напиши 'Не найдено'.
+def get_setting(name: str, default: str = "") -> str:
+    """Read configuration without requiring a local Streamlit secrets file."""
+    environment_value = os.getenv(name)
+    if environment_value:
+        return environment_value.strip()
+    try:
+        value = st.secrets.get(name, default)
+    except (FileNotFoundError, AttributeError):
+        value = default
+    return str(value).strip()
 
-Документ:
-{full_text}
 
-Вопрос: {user_question}"""
-        return call_yandex_gpt(prompt, max_tokens=1000, temperature=0.2)
-    
-    # Режимы "Основные мысли" и "Классификация утверждений"
-    if analysis_type == "Основные мысли":
-        chunk_prompt_template = "Выдели 3-5 основных мыслей из следующего фрагмента документа:\n\n{}"
-        system_prompt = "Ты — помощник для анализа документов. Выделяй только основные идеи, без лишних деталей."
-        synthesis_prompt_template = """Ниже приведены результаты анализа отдельных частей одного документа. Объедини эти результаты в единый связный ответ, выделив основные мысли всего документа целиком. Не повторяй одинаковые мысли, сгруппируй похожее. Ответ должен быть структурирован и легко читаем.
+@st.cache_resource(show_spinner=False)
+def load_embedder(model_name: str) -> FastEmbedder:
+    return FastEmbedder(model_name=model_name)
 
-Результаты по частям:
-{}
 
-Итоговые основные мысли документа:"""
-    elif analysis_type == "Классификация утверждений":
-        chunk_prompt_template = "Классифицируй утверждения из следующего фрагмента документа по категориям: Факты, Мнения, Оценки, Рекомендации. Ответ дай в виде списка.\n\n{}"
-        system_prompt = "Ты — классификатор текста. Относи каждое утверждение к одной из категорий."
-        synthesis_prompt_template = """Ниже приведены результаты классификации отдельных частей одного документа. Объедини эти результаты в единую классификацию для всего документа. Удали дубликаты, сгруппируй похожие утверждения, представь итоговый ответ в виде списка по категориям.
+def reset_document() -> None:
+    for key in (
+        "document_fingerprint",
+        "document_name",
+        "index",
+        "messages",
+        "page_count",
+        "question_count",
+    ):
+        st.session_state.pop(key, None)
 
-Результаты по частям:
-{}
 
-Итоговая классификация для всего документа:"""
-    else:
-        return "Неизвестный тип анализа"
+def show_sources(sources: list[dict[str, object]]) -> None:
+    if not sources:
+        return
+    with st.expander("Sources used", expanded=False):
+        for source in sources:
+            st.markdown(
+                f"**Page {source['page']} · relevance {source['score']:.2f}**"
+            )
+            st.caption(str(source["text"]))
 
-    part_results = []
-    for i, chunk in enumerate(chunks, 1):
-        chunk_prompt = chunk_prompt_template.format(chunk)
-        part_res = call_yandex_gpt(chunk_prompt, max_tokens=1000, temperature=0.3, system_prompt=system_prompt)
-        part_results.append(f"**Часть {i}:**\n{part_res}")
-    
-    # Если документ поместился в один чанк, возвращаем результат напрямую
-    if len(chunks) == 1:
-        return part_results[0]
-    
-    # Иначе – синтезируем итоговый ответ
-    combined = "\n\n---\n\n".join(part_results)
-    synthesis_prompt = synthesis_prompt_template.format(combined)
-    final_answer = call_yandex_gpt(synthesis_prompt, max_tokens=1500, temperature=0.2)
-    return final_answer
 
-# --- Интерфейс Streamlit ---
-st.set_page_config(page_title="Анализатор PDF", page_icon="📄", layout="wide")
-st.title("📄 Анализатор PDF документов")
-st.markdown("Загрузите PDF, и YandexGPT выделит основные мысли или классифицирует утверждения по всему документу.")
+st.set_page_config(
+    page_title="Grounded PDF Q&A",
+    page_icon="📚",
+    layout="wide",
+)
+
+st.title("📚 Grounded PDF Q&A")
+st.markdown(
+    "Ask questions about a PDF and get answers grounded in retrieved passages, "
+    "with page-level citations."
+)
+
+embedding_model = get_setting("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+gemini_model = get_setting("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+hosted_api_key = get_setting("GEMINI_API_KEY")
 
 with st.sidebar:
-    uploaded_file = st.file_uploader("Загрузите PDF", type="pdf")
-    analysis_mode = st.radio(
-        "Режим анализа",
-        ["Основные мысли", "Классификация утверждений", "Ответ на вопрос"]
+    st.header("Document")
+    uploaded_file = st.file_uploader("Upload a PDF", type=("pdf",))
+
+    current_fingerprint = (
+        hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+        if uploaded_file is not None
+        else None
     )
-    user_question = ""
-    if analysis_mode == "Ответ на вопрос":
-        user_question = st.text_area("Ваш вопрос по документу:", height=100)
-    analyze_button = st.button("🔍 Запустить анализ", type="primary")
+    if (
+        current_fingerprint
+        and st.session_state.get("document_fingerprint")
+        and current_fingerprint != st.session_state.document_fingerprint
+    ):
+        reset_document()
 
-if analyze_button and uploaded_file:
-    with st.spinner("Извлечение текста из PDF..."):
-        pdf_reader = PdfReader(uploaded_file)
-        full_text = "".join([page.extract_text() for page in pdf_reader.pages if page.extract_text()])
-        if not full_text.strip():
-            st.error("Не удалось извлечь текст из PDF. Возможно, файл отсканирован.")
-            st.stop()
-        st.sidebar.info(f"📄 Извлечено символов: {len(full_text)}")
+    process_document = st.button(
+        "Build retrieval index",
+        type="primary",
+        use_container_width=True,
+        disabled=uploaded_file is None,
+    )
+    if st.button(
+        "Clear document from session",
+        use_container_width=True,
+        disabled=st.session_state.get("index") is None,
+    ):
+        reset_document()
+        st.rerun()
 
-    if analysis_mode == "Ответ на вопрос" and not user_question.strip():
-        st.warning("Введите вопрос.")
-        st.stop()
+    st.divider()
+    st.header("Generation")
+    if hosted_api_key:
+        api_key = hosted_api_key
+        st.success("Hosted Gemini key configured")
+    else:
+        api_key = st.text_input(
+            "Gemini API key",
+            type="password",
+            help="Kept only in the active app session and never written to disk.",
+        ).strip()
 
-    with st.spinner("Анализ документа..."):
-        if analysis_mode == "Ответ на вопрос":
-            result = analyze_document(full_text, "Ответ на вопрос", user_question=user_question)
+    top_k = st.slider("Retrieved passages", min_value=3, max_value=10, value=6)
+    st.caption(f"LLM: `{gemini_model}`")
+    st.caption(f"Embeddings: `{embedding_model}`")
+
+    st.divider()
+    st.warning(
+        "Do not upload confidential documents. Retrieved passages are sent to "
+        "the configured Gemini API when an answer is generated."
+    )
+
+if process_document and uploaded_file is not None:
+    try:
+        with st.spinner("Extracting and chunking the PDF..."):
+            pdf_bytes = uploaded_file.getvalue()
+            pages = parse_pdf(pdf_bytes)
+            chunks = chunk_pages(pages)
+
+        with st.spinner("Loading the embedding model and building the index..."):
+            embedder = load_embedder(embedding_model)
+            index = VectorIndex.build(chunks, embedder)
+
+        st.session_state.document_fingerprint = hashlib.sha256(pdf_bytes).hexdigest()
+        st.session_state.document_name = uploaded_file.name
+        st.session_state.index = index
+        st.session_state.messages = []
+        st.session_state.page_count = len(pages)
+        st.session_state.question_count = 0
+        st.success("Retrieval index is ready.")
+    except (PDFError, ValueError) as exc:
+        st.error(str(exc))
+    except Exception:
+        logger.exception("Failed to build the document retrieval index")
+        st.error(
+            "The embedding model could not be loaded. Check the deployment "
+            "logs and network access, then try again."
+        )
+
+index: VectorIndex | None = st.session_state.get("index")
+
+if index is None:
+    st.info(
+        "Upload a text-based PDF and build its retrieval index to begin. "
+        "Scanned documents require OCR and are not supported yet."
+    )
+else:
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Document", st.session_state.document_name)
+    col2.metric("Pages with text", st.session_state.page_count)
+    col3.metric("Indexed passages", len(index.chunks))
+
+    for message in st.session_state.get("messages", []):
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            show_sources(message.get("sources", []))
+
+    limit_reached = st.session_state.get("question_count", 0) >= MAX_QUESTIONS_PER_SESSION
+    question = st.chat_input(
+        "Ask a question about the document",
+        disabled=limit_reached,
+    )
+
+    if limit_reached:
+        st.info(
+            "This session reached the demo limit. Upload the document again to "
+            "start a new session."
+        )
+
+    if question:
+        st.session_state.messages.append({"role": "user", "content": question})
+        st.session_state.question_count = st.session_state.get("question_count", 0) + 1
+
+        with st.spinner("Retrieving relevant passages..."):
+            retrieved = index.search(question, top_k=top_k)
+
+        source_data = [
+            {
+                "page": item.chunk.page_number,
+                "score": item.score,
+                "text": item.chunk.text,
+            }
+            for item in retrieved
+        ]
+
+        if not api_key:
+            response_text = (
+                "The relevant passages were retrieved below, but no Gemini API "
+                "key is configured. Add a key in the sidebar to generate a "
+                "grounded answer."
+            )
         else:
-            result = analyze_document(full_text, analysis_mode)
+            try:
+                with st.spinner("Generating a grounded answer..."):
+                    client = GeminiClient(api_key=api_key, model=gemini_model)
+                    response_text = answer_question(client, question, retrieved)
+            except GenerationError as exc:
+                response_text = f"Generation failed: {exc}"
 
-    st.subheader("Результат анализа:")
-    st.write(result)
-
-    with st.expander("Превью извлечённого текста (первые 2000 символов)"):
-        st.text(full_text[:2000] + ("..." if len(full_text) > 2000 else ""))
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": response_text,
+                "sources": source_data,
+            }
+        )
+        st.rerun()
